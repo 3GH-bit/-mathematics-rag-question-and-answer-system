@@ -1,215 +1,78 @@
-"""ChromaDB wrapper.
+# app/core/vectorstore.py
+import os
+from qdrant_client import QdrantClient
+from qdrant_client.models import PointStruct, VectorParams, Distance
+from sentence_transformers import SentenceTransformer, CrossEncoder
 
-One persistent collection holds all chunks. Each chunk stores metadata
-(document_id, filename, category, page, label, chunk_index) so retrieval can
-filter by category/document and return citation info. We pass our own
-embeddings (Chroma's default embedder is disabled) to keep control of the
-model used for both indexing and querying.
-"""
-from __future__ import annotations
-
-from functools import lru_cache
-
-from app.config import get_settings
-from app.core.chunking import Chunk
-from app.core.embeddings import get_embeddings
-
-settings = get_settings()
-
-COLLECTION = "documents"
+# 设置hf镜像，避免下载超时
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 
-@lru_cache
-def _client():
-    import chromadb
+class VectorStore:
+    def __init__(self, collection_name="math_rag"):
+        self.collection_name = collection_name
+        # 本地持久化向量库，保存到 ./qdrant_db 文件夹
+        self.client = QdrantClient(path="./qdrant_db")
+        self.embedding_model = SentenceTransformer("BAAI/bge-small-zh-v1.5")
+        # 重排模型：bge-reranker-base
+        self.rerank_model = CrossEncoder("BAAI/bge-reranker-base")
+        self.vector_size = 512
 
-    return chromadb.PersistentClient(path=str(settings.chroma_dir))
+        # 判断集合是否已经存在，不存在才创建
+        exist_collections = [col.name for col in self.client.get_collections().collections]
+        if self.collection_name not in exist_collections:
+            self.client.create_collection(
+                collection_name=self.collection_name,
+                vectors_config=VectorParams(size=self.vector_size, distance=Distance.COSINE)
+            )
+            print(f"创建新集合 {self.collection_name}")
+        else:
+            print(f"集合 {self.collection_name} 已存在，复用向量库")
 
+    def add_chunks(self, chunks: list[str]):
+        """批量向量化并写入向量库"""
+        valid_texts = []
+        for text in chunks:
+            if isinstance(text, str) and text.strip():
+                valid_texts.append(text.strip())
+        print(f"有效文本数量：{len(valid_texts)}")
+        if len(valid_texts) == 0:
+            return
 
-@lru_cache
-def _collection():
-    # embedding_function=None -> we always supply embeddings explicitly.
-    return _client().get_or_create_collection(
-        name=COLLECTION, metadata={"hnsw:space": "cosine"}
-    )
+        embeddings = self.embedding_model.encode(valid_texts)
+        points = []
+        for idx, (text, vec) in enumerate(zip(valid_texts, embeddings)):
+            point = PointStruct(
+                id=idx,
+                vector=vec.tolist(),
+                payload={"text": text}
+            )
+            points.append(point)
+        self.client.upsert(collection_name=self.collection_name, points=points)
+        print(f"成功入库 {len(points)} 个有效块")
 
-
-def add_document_chunks(
-    *, document_id: str, filename: str, category: str, chunks: list[Chunk]
-) -> None:
-    if not chunks:
-        return
-    emb = get_embeddings()
-    texts = [c.text for c in chunks]
-    vectors = emb.embed(texts)
-    ids = [f"{document_id}:{c.index}" for c in chunks]
-    metadatas = [
-        {
-            "document_id": document_id,
-            "filename": filename,
-            "category": category,
-            "page": c.page,
-            "label": c.label or "",
-            "chunk_index": c.index,
-        }
-        for c in chunks
-    ]
-    _collection().add(ids=ids, documents=texts, embeddings=vectors, metadatas=metadatas)
-
-
-def delete_document(document_id: str) -> None:
-    _collection().delete(where={"document_id": document_id})
-
-
-def query(
-    *,
-    text: str,
-    top_k: int,
-    category: str | None = None,
-    document_ids: list[str] | None = None,
-) -> list[dict]:
-    """Retrieval entry point (chat RAG, agent tool, /api/search).
-
-    Pipeline: vector ANN → optional BM25 fusion (RRF) → optional cross-encoder
-    rerank → top_k. Advanced stages are opt-in via env (SEARCH_HYBRID /
-    SEARCH_RERANK) so the plain demo stays lightweight.
-    """
-    where = _build_where(category, document_ids)
-    emb = get_embeddings()
-
-    count = _collection().count()
-    if count == 0:
-        return []
-
-    use_hybrid = settings.search_hybrid
-    use_rerank = settings.search_rerank
-    n_candidates = max(top_k, settings.retrieval_candidates) if (use_hybrid or use_rerank) else top_k
-    # Chroma падает (RuntimeError "ef or M is too small"), если запросить
-    # больше элементов, чем есть в индексе, — ограничиваем пул размером базы.
-    n_candidates = min(n_candidates, count)
-
-    qvec = emb.embed_query(text)
-    try:
-        res = _collection().query(
-            query_embeddings=[qvec],
-            n_results=n_candidates,
-            where=where or None,
-            include=["documents", "metadatas", "distances"],
+    def search(self, query: str, top_k=3, recall_top=8):
+        """
+        向量检索 + Rerank重排
+        recall_top：先粗召回多条候选，再用rerank筛选top_k条最相关的
+        """
+        query_vec = self.embedding_model.encode(query)
+        # 粗召回更多候选
+        hits = self.client.query_points(
+            collection_name=self.collection_name,
+            query=query_vec.tolist(),
+            limit=recall_top
         )
-    except RuntimeError:
-        # chromadb 0.5.x: после удалений HNSW-индекс может перейти в состояние,
-        # где любой запрос падает («ef or M is too small»). Не роняем чат —
-        # считаем ближайшие соседей сами по эмбеддингам коллекции (brute-force).
-        res = _brute_force_query(qvec, n_candidates, where)
+        candidate_texts = [hit.payload["text"] for hit in hits.points]
+        if len(candidate_texts) == 0:
+            return []
 
-    ids = res.get("ids", [[]])[0]
-    docs = res.get("documents", [[]])[0]
-    metas = res.get("metadatas", [[]])[0]
-    dists = res.get("distances", [[]])[0]
+        # Rerank：问题和候选文本两两打分
+        pairs = [[query, text] for text in candidate_texts]
+        scores = self.rerank_model.predict(pairs)
 
-    hits: list[dict] = []
-    for chunk_id, doc, meta, dist in zip(ids, docs, metas, dists):
-        hits.append(
-            {
-                "id": chunk_id,
-                "text": doc,
-                "document_id": meta.get("document_id"),
-                "filename": meta.get("filename"),
-                "category": meta.get("category"),
-                "page": meta.get("page"),
-                "label": meta.get("label") or None,
-                "chunk_index": meta.get("chunk_index"),
-                # cosine distance -> similarity
-                "score": round(1.0 - float(dist), 4),
-            }
-        )
-
-    if use_hybrid:
-        hits = _fuse_with_bm25(
-            text=text, vector_hits=hits, n_candidates=n_candidates,
-            category=category, document_ids=document_ids,
-        )
-
-    if use_rerank:
-        from app.core.rerank import rerank
-
-        hits = rerank(text, hits)[:top_k]
-        import math
-
-        for h in hits:
-            # cross-encoder logits -> bounded 0..1 for the UI percent display
-            h["score"] = round(1.0 / (1.0 + math.exp(-h["score"] * 4)), 4)
-    else:
-        hits = hits[:top_k]
-    return hits
-
-
-def _brute_force_query(
-    qvec: list[float], n_results: int, where: dict | None
-) -> dict:
-    """Запасной поиск numpy-косинусом по всем эмбеддингам коллекции.
-
-    Включается, когда HNSW-индекс повреждён (RuntimeError). Для демо-объёмов
-    (сотни фрагментов) работает за миллисекунды.
-    """
-    import numpy as np
-
-    data = _collection().get(
-        where=where or None,
-        include=["embeddings", "documents", "metadatas"],
-    )
-    embeddings = data.get("embeddings") or []
-    docs = data.get("documents") or []
-    metas = data.get("metadatas") or []
-    ids = data.get("ids") or []
-    if not embeddings:
-        return {"ids": [[]], "documents": [[]], "metadatas": [[]], "distances": [[]]}
-
-    q = np.array(qvec, dtype=np.float32)
-    matrix = np.array(embeddings, dtype=np.float32)
-    norms = np.linalg.norm(matrix, axis=1) * np.linalg.norm(q)
-    norms[norms == 0] = 1e-9
-    similarities = (matrix @ q) / norms
-    order = np.argsort(-similarities)[:n_results]
-
-    return {
-        "ids": [[ids[i] for i in order]],
-        "documents": [[docs[i] for i in order]],
-        "metadatas": [[metas[i] for i in order]],
-        "distances": [[float(1.0 - similarities[i]) for i in order]],
-    }
-
-
-def _fuse_with_bm25(
-    *,
-    text: str,
-    vector_hits: list[dict],
-    n_candidates: int,
-    category: str | None,
-    document_ids: list[str] | None,
-) -> list[dict]:
-    from app.core.bm25 import bm25_search, rrf_fuse
-
-    vec_ranking = {h["id"]: h["score"] for h in vector_hits}
-    lex_ranking = bm25_search(
-        text=text, top_k=n_candidates, category=category, document_ids=document_ids
-    )
-    fused = rrf_fuse([vec_ranking, lex_ranking])
-    by_id = {h["id"]: h for h in vector_hits}
-    ordered = [by_id[i] for i in sorted(fused, key=fused.get, reverse=True) if i in by_id]
-    # BM25-only matches outside the vector pool are dropped: with the current
-    # snapshot flow they would need a second Chroma lookup for marginal gain.
-    return ordered[:n_candidates]
-
-
-def _build_where(category: str | None, document_ids: list[str] | None) -> dict:
-    clauses: list[dict] = []
-    if category and category != "All":
-        clauses.append({"category": category})
-    if document_ids:
-        clauses.append({"document_id": {"$in": document_ids}})
-    if len(clauses) == 1:
-        return clauses[0]
-    if len(clauses) > 1:
-        return {"$and": clauses}
-    return {}
+        # 按分数降序排序
+        scored_texts = sorted(zip(candidate_texts, scores), key=lambda x: x[1], reverse=True)
+        # 取top_k
+        final_texts = [item[0] for item in scored_texts[:top_k]]
+        return final_texts

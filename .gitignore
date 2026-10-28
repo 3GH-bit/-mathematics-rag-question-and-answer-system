@@ -21,3 +21,13 @@ frontend/dist/
 # Editor
 .vscode/
 .idea/
+
+# 本地大文件（模型 / 向量库 / 生成图 / 测试 PDF，不提交）
+backend/qdrant_db/
+backend/chroma_db/
+backend/.hf_cache/
+backend/.easyocr_models/
+backend/generated_figures/
+backend/*.pdf
+backend/tests/*.pdf
+backend/samples/test.pdf

@@ -1,82 +1,49 @@
-"""RAG pipeline: retrieve context, build a grounded prompt, dedupe sources."""
-from __future__ import annotations
+from app.core.vectorstore import VectorStore
+from openai import OpenAI
 
-from app.config import get_settings
-from app.core import vectorstore
-from app.schemas.dto import Source
-
-settings = get_settings()
-
-SYSTEM_PROMPT_RU = """Ты — ассистент, отвечающий на вопросы СТРОГО по предоставленным \
-документам. Правила:
-- Используй только информацию из блока CONTEXT ниже.
-- Если ответа в контексте нет — честно скажи, что не нашёл информации.
-- Отвечай ПО-РУССКИ, кратко и по делу.
-- Ссылайся на источники в формате [1], [2] по номерам фрагментов из контекста.
-
-CONTEXT:
-{context}
-"""
-
-SYSTEM_PROMPT_EN = """You are an assistant answering questions STRICTLY from the \
-provided documents. Rules:
-- Use only the information in the CONTEXT block below.
-- If the answer isn't in the context, say honestly that you couldn't find it.
-- Answer IN ENGLISH, concise and to the point.
-- Cite sources as [1], [2] by the fragment numbers from the context.
-
-CONTEXT:
-{context}
-"""
-
-SYSTEM_PROMPTS = {"ru": SYSTEM_PROMPT_RU, "en": SYSTEM_PROMPT_EN}
-
-
-def retrieve(
-    *,
-    query: str,
-    top_k: int | None = None,
-    category: str | None = None,
-    document_ids: list[str] | None = None,
-) -> list[dict]:
-    k = top_k or settings.retrieval_top_k
-    return vectorstore.query(
-        text=query, top_k=k, category=category, document_ids=document_ids
-    )
-
-
-def build_context(hits: list[dict]) -> str:
-    blocks = []
-    for i, h in enumerate(hits, start=1):
-        loc = f"стр. {h['page']}" if h.get("page") else ""
-        if h.get("label"):
-            loc = f"{loc} · {h['label']}" if loc else h["label"]
-        header = f"[{i}] {h['filename']} ({loc})".strip()
-        blocks.append(f"{header}\n{h['text']}")
-    return "\n\n---\n\n".join(blocks)
-
-
-def build_system_prompt(hits: list[dict], lang: str = "ru") -> str:
-    empty = "(нет релевантных фрагментов)" if lang == "ru" else "(no relevant fragments)"
-    context = build_context(hits) if hits else empty
-    template = SYSTEM_PROMPTS.get(lang, SYSTEM_PROMPT_RU)
-    return template.format(context=context)
-
-
-def to_sources(hits: list[dict]) -> list[Source]:
-    sources: list[Source] = []
-    for h in hits:
-        snippet = h["text"].strip().replace("\n", " ")
-        if len(snippet) > 320:
-            snippet = snippet[:320].rstrip() + "…"
-        sources.append(
-            Source(
-                document_id=h["document_id"],
-                filename=h["filename"],
-                page=h.get("page"),
-                snippet=snippet,
-                score=h.get("score"),
-                chunk_index=h.get("chunk_index"),
-            )
+class RAGService:
+    def __init__(self):
+        self.vector_store = VectorStore()
+        # ====================== 请修改这里 ======================
+        self.dashscope_api_key = "sk-ws-H.PEREEXY.dG7e.MEUCIQCwh8JH-xx4M2UIiZdebx9voni3wHehEL-tLnR_6vr-wAIgRQ02mjBbO4Uybvo8X0Ee5eKdq5EghNPk2ZZ6xTV7lHw"
+        self.model_name = "qwen-plus"
+        # =======================================================
+        self.client = OpenAI(
+            api_key=self.dashscope_api_key,
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
         )
-    return sources
+
+    def build_prompt(self, question: str, contexts: list[str]) -> str:
+        context_text = "\n\n".join(contexts)
+        prompt = f"""你是一名初中数学老师，专门讲解初中几何。请严格依据下面参考资料回答用户问题。
+参考资料：
+{context_text}
+
+用户问题：{question}
+要求：
+1. 如果参考资料信息不足，如实告知，不要编造知识点。
+2. 语言通俗易懂，符合初中生认知，讲解条理清晰。
+3. 几何术语规范，可以适当举例说明。
+"""
+        return prompt
+
+    def llm_infer(self, prompt: str):
+        try:
+            resp = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                max_tokens=1024
+            )
+            return resp.choices[0].message.content
+        except Exception as e:
+            return f"通义千问API调用失败：{str(e)}"
+
+    def query(self, question: str):
+        # 向量检索
+        contexts = self.vector_store.search(question, n_results=3)
+        prompt = self.build_prompt(question, contexts)
+        answer = self.llm_infer(prompt)
+        return answer, prompt, contexts
